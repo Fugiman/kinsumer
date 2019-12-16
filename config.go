@@ -11,8 +11,9 @@ import (
 
 // Config holds all configuration values for a single Kinsumer instance
 type Config struct {
-	stats  StatReceiver
-	logger Logger
+	stats               StatReceiver
+	logger              Logger
+	fanoutConsumerARN   string
 
 	// ---------- [ Per Shard Worker ] ----------
 	// Time to sleep if no records are found
@@ -57,6 +58,12 @@ func NewConfig() Config {
 		dynamoWaiterDelay:     3 * time.Second,
 		logger:                &DefaultLogger{},
 	}
+}
+
+// WithEnhancedFanoutConsumerARN returns a Config that uses the supplied consumer ARN to enable Kinesis's enhanced fanout feature
+func (c Config) WithEnhancedFanoutConsumerARN(arn string) Config {
+	c.fanoutConsumerARN = arn
+	return c
 }
 
 // WithThrottleDelay returns a Config with a modified throttle delay

@@ -167,7 +167,12 @@ func (k *Kinsumer) consume(shardID string) {
 
 	sequenceNumber := checkpointer.sequenceNumber
 
-	evtCh := k.consumePolling(ctx, shardID, sequenceNumber)
+	var evtCh <-chan consumeEvent
+	if k.config.fanoutConsumerARN != "" {
+		evtCh = k.consumeFanout(ctx, shardID, sequenceNumber)
+	} else {
+		evtCh = k.consumePolling(ctx, shardID, sequenceNumber)
+	}
 
 mainloop:
 	// Continue processing until both the checkpointer and event goroutines are done
@@ -286,6 +291,79 @@ func (k *Kinsumer) consumePolling(ctx context.Context, shardID string, sequenceN
 
 				if finished {
 					return
+				}
+			}
+		}
+	}()
+
+	return ch
+}
+
+// consumeFanout is a blocking call that captures then consumes the given shard in a loop.
+// It is also responsible for writing out the checkpoint updates to dynamo.
+// It is a subfunction of consume and shouldn't be called directly
+func (k *Kinsumer) consumeFanout(ctx context.Context, shardID string, sequenceNumber string) <-chan consumeEvent {
+	ch := make(chan consumeEvent)
+
+	go func() {
+		defer close(ch)
+
+		for {
+			shardIteratorType := kinesis.ShardIteratorTypeAfterSequenceNumber
+			ps := aws.String(sequenceNumber)
+			if sequenceNumber == "" {
+				shardIteratorType = kinesis.ShardIteratorTypeTrimHorizon
+				ps = nil
+			} else if sequenceNumber == "LATEST" {
+				shardIteratorType = kinesis.ShardIteratorTypeLatest
+				ps = nil
+			}
+
+			out, err := k.kinesis.SubscribeToShard(&kinesis.SubscribeToShardInput{
+				ConsumerARN: aws.String(k.config.fanoutConsumerARN),
+				ShardId:     aws.String(shardID),
+				StartingPosition: &kinesis.StartingPosition{
+					Type:           aws.String(shardIteratorType),
+					SequenceNumber: ps,
+				},
+			})
+			if err != nil {
+				k.shardErrors <- shardConsumerError{shardID: shardID, action: "SubscribeToShard", err: err}
+				return
+			}
+
+			// This is an unbuffered channel of kinesis.SubscribeToShardEventStreamEvent
+			// The channel will close when the connection is lost
+			events := out.EventStream.Events()
+
+		getrecordloop:
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case e, ok := <-events:
+					if !ok {
+						break getrecordloop
+					}
+					switch ev := e.(type) {
+					case *kinesis.SubscribeToShardEvent:
+						sequenceNumber = aws.StringValue(ev.ContinuationSequenceNumber)
+						evnt := consumeEvent{
+							Records:        ev.Records,
+							Lag:            time.Duration(aws.Int64Value(ev.MillisBehindLatest)) * time.Millisecond,
+							SequenceNumber: sequenceNumber,
+							// TODO: how do we know when a shard is finished in enhanced fanout?
+						}
+
+						select {
+						case <-ctx.Done():
+							return
+						case ch <- evnt:
+						}
+
+					default:
+						// TODO: what to do if this is an unknown type?
+					}
 				}
 			}
 		}
